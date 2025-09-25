@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/netip"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
 
 	"masque-plus/internal/logutil"
+	"masque-plus/internal/netutil"
 
 	"github.com/quic-go/quic-go"
 )
@@ -27,11 +29,12 @@ const (
 // maxToTry limits how many endpoints will be attempted (cap).
 func TryCandidates(
 	candidates []string,
+	config netutil.MasqueConfig,
 	maxToTry int,
 	ping bool,
-	pingTimeout time.Duration,       // used by QUIC precheck
+	pingTimeout time.Duration, // used by QUIC precheck
 	perEndpointTimeout time.Duration, // informational; enforced by startFn
-	startFn func(ep string) (stop func(), ok bool, err error),
+	url string,
 ) (string, error) {
 
 	if maxToTry <= 0 || maxToTry > len(candidates) {
@@ -39,11 +42,10 @@ func TryCandidates(
 	}
 
 	for i := 0; i < maxToTry; i++ {
-		
 		if i < maxToTry-1 {
 			time.Sleep(1 * time.Second)
 		}
-		
+
 		ep := candidates[i]
 		logutil.Info("candidate", map[string]string{"endpoint": ep, "idx": fmt.Sprint(i + 1), "of": fmt.Sprint(maxToTry)})
 
@@ -53,32 +55,20 @@ func TryCandidates(
 				continue
 			}
 		}
-
-		stop, ok, err := startFn(ep)
-
-		// Always tear down the spawned process before deciding next step.
+		epaddr, err := netip.ParseAddrPort(ep)
 		if err != nil {
-			if stop != nil {
-				stop()
-			}
-			logutil.Info("start failed", map[string]string{"endpoint": ep, "err": err.Error()})
+			return "", err
+		}
+		config.Endpoint = &net.UDPAddr{
+			IP:   net.IP(epaddr.Addr().AsSlice()),
+			Port: int(epaddr.Port()),
+		}
+		err = netutil.TestConnection(config, url, perEndpointTimeout)
+		if err != nil {
+			logutil.Info("endpoint test failed", map[string]string{"endpoint": ep, "timeout": perEndpointTimeout.String()})
 			continue
 		}
-		if ok {
-			logutil.Info("selected endpoint", map[string]string{"endpoint": ep})
-			if stop != nil {
-				stop()
-			}
-			return ep, nil
-		}
-
-		logutil.Info("not ready within per-endpoint timeout", map[string]string{
-			"endpoint": ep,
-			"timeout":  perEndpointTimeout.String(),
-		})
-		if stop != nil {
-			stop()
-		}
+		return ep, nil
 	}
 
 	return "", fmt.Errorf("no viable endpoint found (tried %d)", maxToTry)
@@ -142,7 +132,6 @@ func pickPort(ports []string) string {
 	return ports[rand.Intn(len(ports))]
 }
 
-
 // ---- QUIC precheck ----
 
 // quicProbe does a quick QUIC (HTTP/3) handshake attempt against ep ("host:port" or "[v6]:port").
@@ -155,8 +144,8 @@ func quicProbe(ep string, timeout time.Duration) bool {
 	defer cancel()
 
 	tconf := &tls.Config{
-		InsecureSkipVerify: true,                                // probe only
-		NextProtos:         []string{"h3", "h3-29", "h3-32"},    // common ALPNs
+		InsecureSkipVerify: true,                             // probe only
+		NextProtos:         []string{"h3", "h3-29", "h3-32"}, // common ALPNs
 	}
 	// set SNI only if host is a hostname (not an IP)
 	if host, _, err := net.SplitHostPort(ep); err == nil {

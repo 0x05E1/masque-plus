@@ -11,6 +11,7 @@ import (
 
 	"masque-plus/internal/logutil"
 
+	"github.com/things-go/go-socks5"
 	"golang.org/x/net/proxy"
 )
 
@@ -44,9 +45,24 @@ func CheckWarpOverSocks(bind, url string, timeout time.Duration) (ResultStatus, 
 		})
 		return StatusConnFail, fmt.Errorf("socks5 dialer error: %w", err)
 	}
+	return CheckWarpOverDialer(dialer, url, nil, timeout)
+}
 
+func CheckWarpOverDialer(dialer proxy.Dialer, url string, resolver socks5.NameResolver, timeout time.Duration) (ResultStatus, error) {
+	start := time.Now()
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if resolver != nil {
+				host, port, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, fmt.Errorf("resolve error: %v", err)
+				}
+				_, resolvedIp, err := resolver.Resolve(ctx, host)
+				if err != nil {
+					return nil, fmt.Errorf("resolve error: %v", err)
+				}
+				address = resolvedIp.String() + ":" + port
+			}
 			return dialer.Dial(network, address)
 		},
 		TLSHandshakeTimeout: timeout,
@@ -107,7 +123,6 @@ func CheckWarpOverSocks(bind, url string, timeout time.Duration) (ResultStatus, 
 
 	kv := map[string]string{
 		"url":         url,
-		"bind":        bind,
 		"status_code": fmt.Sprintf("%d", resp.StatusCode),
 		"bytes":       fmt.Sprintf("%d", len(body)),
 		"elapsed":     time.Since(start).String(),
@@ -124,6 +139,7 @@ func CheckWarpOverSocks(bind, url string, timeout time.Duration) (ResultStatus, 
 		"result": string(StatusNoWarp),
 	}))
 	return StatusNoWarp, nil
+
 }
 
 // merge merges two string maps.

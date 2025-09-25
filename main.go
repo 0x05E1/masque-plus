@@ -1,25 +1,28 @@
 package main
 
 import (
-	"bufio"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math/big"
 	mrand "math/rand"
 	"net"
+	"net/netip"
 	"os"
-	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"masque-plus/internal/httpcheck"
+	"masque-plus/internal/cryptoutil"
 	"masque-plus/internal/logutil"
+	"masque-plus/internal/netutil"
 	"masque-plus/internal/scanner"
+
+	"github.com/Diniboy1123/usque/api"
+	usqueConfig "github.com/Diniboy1123/usque/config"
 )
 
 var (
@@ -31,20 +34,23 @@ var (
 		"2606:4700:103::1",
 		"2606:4700:103::2",
 	}
-	defaultRange4         = []string{
+	defaultRange4 = []string{
 		"162.159.192.0/24",
 		"162.159.197.0/24",
 		"162.159.198.0/24",
 	}
-	defaultRange6         = []string{
+	defaultRange6 = []string{
 		"2606:4700:102::/48",
 	}
 	defaultBind           = "127.0.0.1:1080"
 	defaultConfigFile     = "./config.json"
-	defaultUsquePath      = "./usque"
 	defaultConnectTimeout = 15 * time.Minute
 	defaultTestURL        = "https://connectivity.cloudflareclient.com/cdn-cgi/trace"
 	defaultSNI            = "consumer-masque.cloudflareclient.com"
+	defaultDnsStr         = "1.1.1.1,8.8.8.8"
+
+	defaultModel  = "PC"
+	defaultLocale = "en_US"
 )
 
 var (
@@ -57,12 +63,10 @@ var (
 	mtu               = 1280
 	noTunnelIpv4      bool
 	noTunnelIpv6      bool
-	password          string
-	username          string
 	reconnectDelay    = 1 * time.Second
 	sni               = defaultSNI
 	useIpv6           bool
-	Version = "dev"
+	Version           = "dev"
 )
 
 func main() {
@@ -71,8 +75,7 @@ func main() {
 		logutil.Msg("INFO", fmt.Sprintf("Environment: %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH), nil)
 		os.Exit(0)
 	}
-
-	endpoint := flag.String("endpoint", "", "Endpoint to connect (IPv4, IPv6, domain; host or host:Port; for IPv6 with port use [IPv6]:Port)")
+	endpointStr := flag.String("endpoint", "", "Endpoint to connect (IPv4, IPv6, domain; host or host:Port; for IPv6 with port use [IPv6]:Port)")
 	bind := flag.String("bind", defaultBind, "IP:Port to bind SOCKS proxy")
 	renew := flag.Bool("renew", false, "Force renewal of config even if config.json exists")
 	scan := flag.Bool("scan", false, "Scan/auto-select a default endpoint")
@@ -86,14 +89,14 @@ func main() {
 	reserved := flag.String("reserved", "", "placeholder flag, not used")
 	scanPerIP := flag.Duration("scan-timeout", 5*time.Second, "Per-endpoint scan timeout (dial+handshake)")
 	scanMax := flag.Int("scan-max", 30, "Maximum number of endpoints to try during scan")
-	scanVerboseChild := flag.Bool("scan-verbose-child", false, "Print MASQUE child process logs during scan")
-	scanTunnelFailLimit := flag.Int("scan-tunnel-fail-limit", 2, "Number of 'Failed to connect tunnel' occurrences before skipping an endpoint")
+	// scanVerboseChild := flag.Bool("scan-verbose-child", false, "Print MASQUE child process logs during scan")
+	// scanTunnelFailLimit := flag.Int("scan-tunnel-fail-limit", 2, "Number of 'Failed to connect tunnel' occurrences before skipping an endpoint")
 	scanOrdered := flag.Bool("scan-ordered", false, "Scan candidates in CIDR order (disable shuffling)")
 	testURL := flag.String("test-url", defaultTestURL, "URL used to verify connectivity over the SOCKS tunnel")
 
 	// usque-specific flags
 	flag.IntVar(&connectPort, "connect-port", connectPort, "Used port for MASQUE connection")
-	flag.StringVar(&dnsStr, "dns", dnsStr, "comma-separated DNS servers to use")
+	flag.StringVar(&dnsStr, "dns", defaultDnsStr, "comma-separated DNS servers to use")
 	flag.DurationVar(&dnsTimeout, "dns-timeout", dnsTimeout, "Timeout for DNS queries")
 	flag.IntVar(&initialPacketSize, "initial-packet-size", initialPacketSize, "Initial packet size for MASQUE connection")
 	flag.DurationVar(&keepalivePeriod, "keepalive-period", keepalivePeriod, "Keepalive period for MASQUE connection")
@@ -101,8 +104,8 @@ func main() {
 	flag.IntVar(&mtu, "mtu", mtu, "MTU for MASQUE connection")
 	flag.BoolVar(&noTunnelIpv4, "no-tunnel-ipv4", noTunnelIpv4, "Disable IPv4 inside the MASQUE tunnel")
 	flag.BoolVar(&noTunnelIpv6, "no-tunnel-ipv6", noTunnelIpv6, "Disable IPv6 inside the MASQUE tunnel")
-	flag.StringVar(&password, "password", password, "Password for proxy authentication")
-	flag.StringVar(&username, "username", username, "Username for proxy authentication")
+	// flag.StringVar(&password, "password", password, "Password for proxy authentication")
+	// flag.StringVar(&username, "username", username, "Username for proxy authentication")
 	flag.DurationVar(&reconnectDelay, "reconnect-delay", reconnectDelay, "Delay between reconnect attempts")
 	flag.StringVar(&sni, "sni", sni, "SNI address to use for MASQUE connection")
 	flag.BoolVar(&useIpv6, "ipv6", useIpv6, "Use IPv6 for MASQUE connection")
@@ -116,17 +119,17 @@ func main() {
 	if *v4Flag && *v6Flag {
 		logErrorAndExit("both -4 and -6 provided")
 	}
-	if *endpoint == "" && !*scan {
+	if *endpointStr == "" && !*scan {
 		logErrorAndExit("--endpoint is required")
 	}
 
 	configFile := defaultConfigFile
-	usquePath := defaultUsquePath
+	usqueConfig.LoadConfig(configFile)
 
-	logInfo("running in masque mode", nil)
+	logutil.Info("running in masque mode", nil)
 
 	if *scan {
-		logInfo("scanner mode enabled", nil)
+		logutil.Info("scanner mode enabled", nil)
 		candidates := buildCandidatesFromFlags(*v6Flag, *v4Flag, *range4, *range6)
 
 		if len(candidates) > 1 && !*scanOrdered {
@@ -141,105 +144,70 @@ func main() {
 			if err != nil {
 				logErrorAndExit(err.Error())
 			}
-			*endpoint = chosen
+			*endpointStr = chosen
 		} else {
-			bindIP, bindPort := mustSplitBind(*bind)
-
-			startFn := func(ep string) (func(), bool, error) {
-				cmdCfg := make(map[string]interface{})
-				if data, err := os.ReadFile(configFile); err == nil {
-					_ = json.Unmarshal(data, &cmdCfg)
+			var dnsAddrs []netip.Addr
+			for _, addr := range splitCSV(dnsStr) {
+				dnsAddr, err := netip.ParseAddr(addr)
+				if err != nil {
+					logErrorAndExit(fmt.Sprintf("%v", err))
 				}
-				addEndpointToConfig(cmdCfg, ep)
-				if err := writeConfig(configFile, cmdCfg); err != nil {
-					return nil, false, err
+				dnsAddrs = append(dnsAddrs, dnsAddr)
+			}
+			var localAddresses []netip.Addr
+			if !noTunnelIpv4 {
+				v4, err := netip.ParseAddr(usqueConfig.AppConfig.IPv4)
+				if err != nil {
+					logErrorAndExit(fmt.Sprintf("%v", err))
 				}
-
-				host, port, _ := parseEndpoint(ep)
-				localPort := 443
-				if port != "" {
-					localPort, _ = strconv.Atoi(port)
+				localAddresses = append(localAddresses, v4)
+			}
+			if !noTunnelIpv6 {
+				v6, err := netip.ParseAddr(usqueConfig.AppConfig.IPv6)
+				if err != nil {
+					logErrorAndExit(fmt.Sprintf("%v", err))
 				}
-				ip := net.ParseIP(host)
-				localIpv6 := ip != nil && ip.To4() == nil
+				localAddresses = append(localAddresses, v6)
+			}
+			privKey, err := usqueConfig.AppConfig.GetEcPrivateKey()
+			if err != nil {
+				logErrorAndExit(fmt.Sprintf("%v", err))
+			}
 
-				logConfig(ep, bindIP, bindPort)
-				cmd := createUsqueCmd(usquePath, configFile, bindIP, bindPort, localPort, localIpv6)
-				stdout, _ := cmd.StdoutPipe()
-				stderr, _ := cmd.StderrPipe()
-
-				if err := cmd.Start(); err != nil {
-					return nil, false, err
-				}
-
-				st := &procState{}
-				go handleScanner(bufio.NewScanner(stdout), bindIP+":"+bindPort, st, cmd, *scanVerboseChild, *scanTunnelFailLimit)
-				go handleScanner(bufio.NewScanner(stderr), bindIP+":"+bindPort, st, cmd, *scanVerboseChild, *scanTunnelFailLimit)
-
-				deadline := time.Now().Add(*scanPerIP)
-				for time.Now().Before(deadline) {
-					st.mu.Lock()
-					ok := st.connected
-					hsFail := st.handshakeFail
-					st.mu.Unlock()
-
-					if ok {
-						break
-					}
-					if hsFail {
-						stop := func() { _ = cmd.Process.Kill() }
-						return stop, false, fmt.Errorf("handshake failure")
-					}
-					time.Sleep(120 * time.Millisecond)
-				}
-
-				st.mu.Lock()
-				ok := st.connected
-				st.mu.Unlock()
-
-				stop := func() { _ = cmd.Process.Kill() }
-
-				if ok {
-					wcTimeout := *scanPerIP
-					if wcTimeout <= 0 || wcTimeout > 5*time.Second {
-						wcTimeout = 5 * time.Second
-					}
-
-					bindAddr := fmt.Sprintf("%s:%s", bindIP, bindPort)
-					status, err := httpcheck.CheckWarpOverSocks(bindAddr, *testURL, wcTimeout)
-					fields := map[string]string{
-						"endpoint": ep,
-						"bind":     bindAddr,
-						"status":   string(status),
-						"url":      *testURL,
-						"timeout":  wcTimeout.String(),
-					}
-					if err != nil {
-						fields["error"] = err.Error()
-						logutil.Warn("warp check result", fields)
-					} else {
-						logutil.Info("warp check result", fields)
-					}
-				}
-
-				return stop, ok, nil
+			peerPubKey, err := usqueConfig.AppConfig.GetEcEndpointPublicKey()
+			if err != nil {
+				logErrorAndExit(fmt.Sprintf("%v", err))
 			}
 
 			chosen, err := scanner.TryCandidates(
 				candidates,
+				netutil.MasqueConfig{
+					PrivKey:           privKey,
+					PeerPubKey:        peerPubKey,
+					LocalAddresses:    localAddresses,
+					UseIpv6:           useIpv6,
+					SNI:               sni,
+					DnsAddrs:          dnsAddrs,
+					MTU:               mtu,
+					InitialPacketSize: uint16(initialPacketSize),
+					KeepalivePeriod:   keepalivePeriod,
+					ReconnectDelay:    reconnectDelay,
+					DnsTimeout:        dnsTimeout,
+					LocalDns:          localDns,
+				},
 				*scanMax,
 				*pingFlag,
 				3*time.Second,
 				*scanPerIP,
-				startFn,
+				*testURL,
 			)
 			if err != nil {
 				logErrorAndExit(err.Error())
 			}
-			*endpoint = chosen
+			*endpointStr = chosen
 		}
 	} else {
-		host, port, err := parseEndpoint(*endpoint)
+		host, port, err := parseEndpoint(*endpointStr)
 		if err != nil {
 			logErrorAndExit(fmt.Sprintf("invalid endpoint: %v", err))
 		}
@@ -247,7 +215,7 @@ func main() {
 		if ip != nil {
 			isV6 := ip.To4() == nil
 			if useIpv6 != isV6 {
-				logInfo(fmt.Sprintf("warning: endpoint is IPv%d but --ipv6=%v; overriding to match endpoint", map[bool]int{true: 6, false: 4}[isV6], useIpv6), nil)
+				logutil.Info(fmt.Sprintf("warning: endpoint is IPv%d but --ipv6=%v; overriding to match endpoint", map[bool]int{true: 6, false: 4}[isV6], useIpv6), nil)
 				useIpv6 = isV6
 			}
 		} else if sni == defaultSNI {
@@ -264,31 +232,95 @@ func main() {
 	bindIP, bindPort := mustSplitBind(*bind)
 
 	if needRegister(configFile, *renew) {
-		if err := runRegister(usquePath); err != nil {
+		if err := runRegister(configFile); err != nil {
 			logErrorAndExit(fmt.Sprintf("failed to register: %v", err))
 		}
 	}
-	logInfo("successfully loaded masque identity", nil)
+	logutil.Info("successfully loaded masque identity", nil)
 
 	cfg := make(map[string]interface{})
 	if data, err := os.ReadFile(configFile); err == nil {
 		_ = json.Unmarshal(data, &cfg)
 	}
 
-	addEndpointToConfig(cfg, *endpoint)
+	addEndpointToConfig(cfg, *endpointStr)
 
 	if err := writeConfig(configFile, cfg); err != nil {
 		logErrorAndExit(fmt.Sprintf("failed to write config: %v", err))
 	}
 
-	logConfig(*endpoint, bindIP, bindPort)
-	if err := runSocks(usquePath, configFile, bindIP, bindPort, *connectTimeout); err != nil {
+	logConfig(*endpointStr, bindIP, bindPort)
+
+	var dnsAddrs []netip.Addr
+	for _, addr := range splitCSV(dnsStr) {
+		dnsAddr, err := netip.ParseAddr(addr)
+		if err != nil {
+			logErrorAndExit(fmt.Sprintf("%v", err))
+		}
+		dnsAddrs = append(dnsAddrs, dnsAddr)
+	}
+	var localAddresses []netip.Addr
+	if !noTunnelIpv4 {
+		v4, err := netip.ParseAddr(usqueConfig.AppConfig.IPv4)
+		if err != nil {
+			logErrorAndExit(fmt.Sprintf("%v", err))
+		}
+		localAddresses = append(localAddresses, v4)
+	}
+	if !noTunnelIpv6 {
+		v6, err := netip.ParseAddr(usqueConfig.AppConfig.IPv6)
+		if err != nil {
+			logErrorAndExit(fmt.Sprintf("%v", err))
+		}
+		localAddresses = append(localAddresses, v6)
+	}
+	var endpoint *net.UDPAddr
+	if useIpv6 {
+		endpoint = &net.UDPAddr{
+			IP:   net.ParseIP(usqueConfig.AppConfig.EndpointV6),
+			Port: connectPort,
+		}
+	} else {
+		endpoint = &net.UDPAddr{
+			IP:   net.ParseIP(usqueConfig.AppConfig.EndpointV4),
+			Port: connectPort,
+		}
+	}
+	privKey, err := usqueConfig.AppConfig.GetEcPrivateKey()
+	if err != nil {
+		logErrorAndExit(fmt.Sprintf("%v", err))
+	}
+
+	peerPubKey, err := usqueConfig.AppConfig.GetEcEndpointPublicKey()
+	if err != nil {
+		logErrorAndExit(fmt.Sprintf("%v", err))
+	}
+
+	socksConfiguration := netutil.SocksConfig{
+		BindIP:   bindIP,
+		BindPort: bindPort,
+		MasqueConfig: netutil.MasqueConfig{
+			PrivKey:           privKey,
+			PeerPubKey:        peerPubKey,
+			LocalAddresses:    localAddresses,
+			Endpoint:          endpoint,
+			UseIpv6:           useIpv6,
+			SNI:               sni,
+			DnsAddrs:          dnsAddrs,
+			MTU:               mtu,
+			InitialPacketSize: uint16(initialPacketSize),
+			KeepalivePeriod:   keepalivePeriod,
+			ReconnectDelay:    reconnectDelay,
+			DnsTimeout:        dnsTimeout,
+			LocalDns:          localDns,
+		},
+	}
+	if err := netutil.RunMasqueSocks(socksConfiguration, *connectTimeout); err != nil {
 		logErrorAndExit(fmt.Sprintf("SOCKS start failed: %v", err))
 	}
 }
 
 // ------------------------ Helpers ------------------------
-
 func buildCandidatesFromFlags(v6, v4 bool, r4csv, r6csv string) []string {
 	ports := []string{
 		"443",
@@ -321,7 +353,7 @@ func buildCandidatesFromFlags(v6, v4 bool, r4csv, r6csv string) []string {
 
 	cands, err := scanner.BuildCandidates(ver, r4, r6, ports)
 	if err != nil {
-		logInfo(fmt.Sprintf("scanner.BuildCandidates error: %v", err), nil)
+		logutil.Info(fmt.Sprintf("scanner.BuildCandidates error: %v", err), nil)
 		return nil
 	}
 	return cands
@@ -395,11 +427,7 @@ func logConfig(endpoint, bindIP, bindPort string) {
 		"mtu":          strconv.Itoa(mtu),
 		"keepalive":    keepalivePeriod.String(),
 	}
-	if username != "" || password != "" {
-		fields["username"] = username
-		fields["password"] = "[set]" // avoid logging password
-	}
-	logInfo("starting usque with configuration", fields)
+	logutil.Info("starting usque with configuration", fields)
 }
 
 // ------------------------ Endpoint ------------------------
@@ -456,11 +484,11 @@ func addEndpointToConfig(cfg map[string]interface{}, endpoint string) {
 		if ip.To4() != nil {
 			cfg["endpoint_v4"] = host
 			cfg["endpoint_v4_port"] = port
-			logInfo("using IPv4 endpoint", nil)
+			logutil.Info("using IPv4 endpoint", nil)
 		} else {
 			cfg["endpoint_v6"] = host
 			cfg["endpoint_v6_port"] = port
-			logInfo("using IPv6 endpoint", nil)
+			logutil.Info("using IPv6 endpoint", nil)
 		}
 		return
 	}
@@ -507,7 +535,7 @@ func addEndpointToConfig(cfg map[string]interface{}, endpoint string) {
 	}
 	cfg["endpoint_"+version] = chosen.String()
 	cfg["endpoint_"+version+"_port"] = port
-	logInfo(fmt.Sprintf("using resolved IPv%s endpoint for %s", map[bool]string{true: "6", false: "4"}[isV6], host), nil)
+	logutil.Info(fmt.Sprintf("using resolved IPv%s endpoint for %s", map[bool]string{true: "6", false: "4"}[isV6], host), nil)
 }
 
 func needRegister(configFile string, renew bool) bool {
@@ -522,267 +550,39 @@ func needRegister(configFile string, renew bool) bool {
 
 // ------------------------ Process & Scanner ------------------------
 
-type procState struct {
-	mu             sync.Mutex
-	connected      bool
-	privateKeyErr  bool
-	endpointErr    bool
-	handshakeFail  bool
-	serveAddrShown bool
-	tunnelFailCnt  int
-}
-
-func (st *procState) markConnected() {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.connected = true
-}
-
-func runRegister(path string) error {
-    errorKeywords := []string{
-        "registering with locale",
-        "you already have a config",
-        "you must accept the terms of service",
-        "enrolling device key",
-        "successful registration",
-        "config saved",
-        "only use the register command",
-        "failed to open config file",
-    }
-
-    cmd := exec.Command(path, "register", "-n", "masque-plus")
-    stdin, _ := cmd.StdinPipe()
-    stdout, _ := cmd.StdoutPipe()
-    stderr, _ := cmd.StderrPipe()
-
-    if err := cmd.Start(); err != nil {
-        return err
-    }
-
-    go func() {
-        scan := bufio.NewScanner(stdout)
-        for scan.Scan() {
-            line := scan.Text()
-            skip := false
-            for _, kw := range errorKeywords {
-                if strings.Contains(strings.ToLower(line), kw) {
-                    skip = true
-                    break
-                }
-            }
-            if !skip {
-                fmt.Println(line)
-            }
-        }
-    }()
-
-    go func() {
-        scan := bufio.NewScanner(stderr)
-        for scan.Scan() {
-            line := scan.Text()
-            skip := false
-            for _, kw := range errorKeywords {
-                if strings.Contains(strings.ToLower(line), kw) {
-                    skip = true
-                    break
-                }
-            }
-            if !skip {
-                fmt.Fprintln(os.Stderr, line)
-            }
-        }
-    }()
-
-    go func() {
-        time.Sleep(100 * time.Millisecond)
-        stdin.Write([]byte("y\n"))
-        time.Sleep(100 * time.Millisecond)
-        stdin.Write([]byte("y\n"))
-        stdin.Close()
-    }()
-
-    return cmd.Wait()
-}
-
-func createUsqueCmd(usquePath, config, bindIP, bindPort string, masquePort int, useV6 bool) *exec.Cmd {
-	args := []string{"socks", "--config", config, "-b", bindIP, "-p", bindPort, "-P", strconv.Itoa(masquePort), "-s", sni}
-
-	if useV6 {
-		args = append(args, "-6")
-	}
-	if dnsStr != "" {
-		for _, d := range splitCSV(dnsStr) {
-			if ip := net.ParseIP(d); ip == nil {
-				logInfo(fmt.Sprintf("warning: invalid DNS server %q; ignoring", d), nil)
-				continue
-			}
-			args = append(args, "-d", d)
-		}
-	}
-	args = append(args, "-t", dnsTimeout.String())
-	args = append(args, "-i", strconv.Itoa(initialPacketSize))
-	args = append(args, "-k", keepalivePeriod.String())
-	if localDns {
-		args = append(args, "-l")
-	}
-	args = append(args, "-m", strconv.Itoa(mtu))
-	if noTunnelIpv4 {
-		args = append(args, "-F")
-	}
-	if noTunnelIpv6 {
-		args = append(args, "-S")
-	}
-	if username != "" && password != "" {
-		args = append(args, "-u", username, "-w", password)
-	} else if username != "" || password != "" {
-		logInfo("warning: both --username and --password must be provided for authentication; ignoring", nil)
-	}
-	args = append(args, "-r", reconnectDelay.String())
-
-	return exec.Command(usquePath, args...)
-}
-
-func runSocks(path, config, bindIP, bindPort string, connectTimeout time.Duration) error {
-	cmd := createUsqueCmd(path, config, bindIP, bindPort, connectPort, useIpv6)
-
-	stdout, err := cmd.StdoutPipe()
+func runRegister(configFile string) error {
+	accountData, err := api.Register(defaultModel, defaultLocale, "", true)
 	if err != nil {
 		return err
 	}
-	stderr, err := cmd.StderrPipe()
+	privKey, pubKey, err := cryptoutil.GenerateEcKeyPair()
 	if err != nil {
 		return err
 	}
-
-	if err := cmd.Start(); err != nil {
+	updatedAccountData, apiErr, err := api.EnrollKey(accountData, pubKey, "masque-plus")
+	if err != nil {
+		if apiErr != nil {
+			return fmt.Errorf("(API Errors: %s) %s", apiErr.ErrorsAsString("; "), err)
+		}
 		return err
 	}
-
-	state := &procState{}
-	go handleScanner(bufio.NewScanner(stdout), bindIP+":"+bindPort, state, cmd, true, 3)
-	go handleScanner(bufio.NewScanner(stderr), bindIP+":"+bindPort, state, cmd, true, 3)
-
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
-
-	start := time.Now()
-
-	for {
-		select {
-		case err := <-waitCh:
-			if state.privateKeyErr {
-				return fmt.Errorf("failed to get private key")
-			}
-			if state.endpointErr {
-				return fmt.Errorf("failed to set endpoint")
-			}
-			if state.handshakeFail {
-				return fmt.Errorf("handshake failure")
-			}
-			return err
-
-		default:
-			state.mu.Lock()
-			connected := state.connected
-			state.mu.Unlock()
-
-			if connected {
-				select {}
-			}
-
-			if time.Since(start) > connectTimeout {
-				_ = cmd.Process.Kill()
-				return fmt.Errorf("connect timeout after %s", connectTimeout)
-			}
-
-			time.Sleep(200 * time.Millisecond)
-		}
+	usqueConfig.AppConfig = usqueConfig.Config{
+		PrivateKey:     base64.StdEncoding.EncodeToString(privKey),
+		EndpointV4:     updatedAccountData.Config.Peers[0].Endpoint.V4[:len(updatedAccountData.Config.Peers[0].Endpoint.V4)-2],
+		EndpointV6:     updatedAccountData.Config.Peers[0].Endpoint.V6[1 : len(updatedAccountData.Config.Peers[0].Endpoint.V6)-3],
+		EndpointPubKey: updatedAccountData.Config.Peers[0].PublicKey,
+		License:        updatedAccountData.Account.License,
+		ID:             updatedAccountData.ID,
+		AccessToken:    accountData.Token,
+		IPv4:           updatedAccountData.Config.Interface.Addresses.V4,
+		IPv6:           updatedAccountData.Config.Interface.Addresses.V6,
 	}
-}
-
-func handleScanner(scan *bufio.Scanner, bind string, st *procState, cmd *exec.Cmd, logChild bool, tunnelFailLimit int) {
-	if tunnelFailLimit <= 0 {
-		tunnelFailLimit = 1
-	}
-
-	skipKeywords := []string{
-		"server: not support version",
-		"server: writeto tcp",
-		"server: readfrom tcp",
-		"server: failed to resolve destination",
-		"wsarecv: an established connection was",
-		"wsasend: an established connection was",
-		"datagram frame too large",
-	}
-
-	for scan.Scan() {
-		line := scan.Text()
-		lower := strings.ToLower(line)
-
-		skip := false
-		for _, kw := range skipKeywords {
-			if strings.Contains(lower, kw) {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-
-		if logChild {
-			logInfo(line, nil)
-		}
-
-		st.mu.Lock()
-		switch {
-		case strings.Contains(line, "Connected to MASQUE server"):
-			if !st.serveAddrShown {
-				logInfo("serving proxy", map[string]string{"address": bind})
-				st.serveAddrShown = true
-			}
-			st.connected = true
-
-		case strings.Contains(lower, "tls: handshake") ||
-			strings.Contains(lower, "handshake failure") ||
-			strings.Contains(lower, "crypto_error") ||
-			strings.Contains(lower, "remote error"):
-			st.handshakeFail = true
-			_ = cmd.Process.Kill()
-
-		case strings.Contains(lower, "invalid endpoint") ||
-			strings.Contains(lower, "invalid sni") ||
-			strings.Contains(lower, "dns resolution failed"):
-			st.endpointErr = true
-			_ = cmd.Process.Kill()
-
-		case strings.Contains(lower, "login failed!"):
-			_ = cmd.Process.Kill()
-
-		case strings.Contains(lower, "failed to connect tunnel"):
-			st.tunnelFailCnt++
-			if st.tunnelFailCnt >= tunnelFailLimit {
-				_ = cmd.Process.Kill()
-			}
-
-		case strings.Contains(lower, "failed to get private key"):
-			st.privateKeyErr = true
-			_ = cmd.Process.Kill()
-		}
-		st.mu.Unlock()
-	}
+	return usqueConfig.AppConfig.SaveConfig(configFile)
 }
 
 // ------------------------ Logging ------------------------
 
-func logInfo(msg string, fields map[string]string) {
-	if fields == nil {
-		fields = make(map[string]string)
-	}
-	logutil.Msg("INFO", msg, fields)
-}
-
 func logErrorAndExit(msg string) {
-	logutil.Msg("ERROR", msg, nil)
+	logutil.Error(msg, nil)
 	os.Exit(1)
 }
